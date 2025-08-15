@@ -52,7 +52,7 @@ def get_pair(ex, a, b):
 # ---------------------------
 # Calculate profit for a cycle
 # ---------------------------
-def calculate_profit(ex, tickers, ob_cache, cycle, fee, min_volume, trade_size):
+def calculate_profit(ex, tickers, ob_cache, cycle, fee, min_volume, trade_size, volume_filter_on):
     amount = trade_size
     initial_amount = amount
     before_fees_product = 1.0
@@ -66,15 +66,15 @@ def calculate_profit(ex, tickers, ob_cache, cycle, fee, min_volume, trade_size):
         if not pair or pair not in tickers:
             return None, None
 
-        # Volume check
-        if tickers[pair]['quoteVolume'] < min_volume:
+        # Optional volume check
+        if volume_filter_on and tickers[pair].get('quoteVolume', 0) < min_volume:
             return None, None
 
         # Fetch order book if not cached
         if pair not in ob_cache:
             try:
                 ob_cache[pair] = ex.fetch_order_book(pair, limit=limit_val)
-                time.sleep(0.05)  # short pause to respect limits
+                time.sleep(0.05)
             except Exception:
                 return None, None
 
@@ -86,16 +86,15 @@ def calculate_profit(ex, tickers, ob_cache, cycle, fee, min_volume, trade_size):
         ask_price, ask_vol = ob['asks'][0]
         base, quote = pair.split('/')
 
-        # Try both trade directions automatically
         if base == from_c and quote == to_c:  # Sell base for quote
             rate = bid_price
             needed_base = amount
-            if bid_vol < needed_base:
+            if ask_vol < needed_base:
                 return None, None
         elif base == to_c and quote == from_c:  # Buy base with quote
             rate = 1 / ask_price
             needed_base = amount / ask_price
-            if ask_vol < needed_base:
+            if bid_vol < needed_base:
                 return None, None
         else:
             return None, None
@@ -112,7 +111,7 @@ def calculate_profit(ex, tickers, ob_cache, cycle, fee, min_volume, trade_size):
 # ---------------------------
 # Streamlit UI
 # ---------------------------
-st.title("Triangular Arbitrage Scanner")
+st.title("Triangular Arbitrage Scanner (Debug Mode)")
 
 col1, col2, col3, col4, col5, col6 = st.columns(6)
 with col1:
@@ -122,13 +121,15 @@ with col1:
 with col2:
     base_currency = st.selectbox("Base Currency", ["USDT", "BTC", "ETH", "USD", "BNB"])
 with col3:
-    min_profit = st.number_input("Min Profit %", min_value=0.0, value=0.1, step=0.05)
+    min_profit = st.number_input("Min Profit %", min_value=0.0, value=0.0, step=0.05)
 with col4:
     min_volume = st.number_input("Min 24h Volume", min_value=0, value=100000, step=10000)
 with col5:
     trade_size = st.number_input("Trade Size", min_value=0, value=1000, step=100)
 with col6:
     num_opp = st.selectbox("Num Opportunities", [10, 15, 20])
+
+volume_filter_on = st.checkbox("Enable Volume Filtering", value=True)
 
 # ---------------------------
 # Scan button
@@ -141,9 +142,9 @@ if st.button("Scan for Opportunities"):
             ex.load_markets()
 
             triangles = find_triangles(ex.markets, base_currency.upper())
-            st.write(f"🔍 Found {len(triangles)} raw triangles before filtering.")
+            st.write(f"🔍 Raw triangles found: {len(triangles)}")
 
-            # Limit triangles for heavy exchanges
+            # Limit triangles for Binance
             max_triangles = 150 if exchange_name.lower() == "binance" else 400
             triangles = triangles[:max_triangles]
 
@@ -158,28 +159,31 @@ if st.button("Scan for Opportunities"):
             ob_cache = {}
             opps = []
             passed_volume_check = 0
+            filtered_out_samples = []
 
             for tri in triangles:
                 for direction in [list(tri), list(tri)[::-1]]:
-                    # Quick volume check before order book fetch
-                    volume_ok = True
-                    for i in range(3):
-                        from_c = direction[i]
-                        to_c = direction[(i + 1) % 3]
-                        pair = get_pair(ex, from_c, to_c)
-                        if not pair or pair not in tickers:
-                            volume_ok = False
-                            break
-                        if tickers[pair]['quoteVolume'] < min_volume:
-                            volume_ok = False
-                            break
-
-                    if not volume_ok:
-                        continue
-                    passed_volume_check += 1
+                    if volume_filter_on:
+                        # Pre-check volumes before full calculation
+                        vol_fail = False
+                        for i in range(3):
+                            from_c = direction[i]
+                            to_c = direction[(i + 1) % 3]
+                            pair = get_pair(ex, from_c, to_c)
+                            if not pair or pair not in tickers:
+                                vol_fail = True
+                                break
+                            if tickers[pair].get('quoteVolume', 0) < min_volume:
+                                vol_fail = True
+                                break
+                        if vol_fail:
+                            if len(filtered_out_samples) < 5:
+                                filtered_out_samples.append(direction)
+                            continue
+                        passed_volume_check += 1
 
                     profit_before, profit_after = calculate_profit(
-                        ex, tickers, ob_cache, direction, fee, min_volume, trade_size
+                        ex, tickers, ob_cache, direction, fee, min_volume, trade_size, volume_filter_on
                     )
 
                     if profit_after is not None and profit_after > min_profit:
@@ -191,11 +195,13 @@ if st.button("Scan for Opportunities"):
                             'Fee % (total for 3 trades)': round(fee * 3 * 100, 4)
                         })
 
-                    # Respect rate limits
-                    delay = 0.3 if exchange_name.lower() == "binance" else 0.15
-                    time.sleep(delay)
+                    time.sleep(0.3 if exchange_name.lower() == "binance" else 0.15)
 
-            st.write(f"📊 Triangles passing volume check: {passed_volume_check}")
+            if volume_filter_on:
+                st.write(f"📊 Triangles passing volume check: {passed_volume_check}")
+                st.write(f"🚫 Sample filtered triangles (due to volume): {filtered_out_samples}")
+            else:
+                st.write("⚠ Volume filtering disabled — results may include low-liquidity pairs.")
 
             if opps:
                 opps.sort(key=lambda x: x['Final Profit % (after fees)'], reverse=True)
