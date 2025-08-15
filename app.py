@@ -4,8 +4,8 @@ from collections import defaultdict
 import pandas as pd
 import time
 
-# Function to find all unique triangles (3-currency cycles), filtered for spot markets
-def find_triangles(markets, ex):
+# Function to find all unique triangles (3-currency cycles), filtered for spot markets and base currency
+def find_triangles(markets, ex, base_currency):
     graph = defaultdict(set)
     currencies = set()
     for symbol, market in markets.items():
@@ -25,7 +25,7 @@ def find_triangles(markets, ex):
                 n2 = neighbors[j]
                 if n2 in graph[n1]:
                     tri = tuple(sorted([node, n1, n2]))
-                    if tri not in triangles:
+                    if base_currency in tri and tri not in triangles:
                         triangles.append(tri)
     return triangles
 
@@ -44,20 +44,23 @@ def calculate_profit(ex, tickers, ob_cache, cycle, fee, min_volume, trade_size):
     amount = trade_size
     initial_amount = amount
     before_fees_product = 1.0
-    limit_val = 20 if ex.id == 'kucoin' else 1  # KuCoin requires min 20
+    limit_val = 20 if ex.id in ['kucoin', 'bybit', 'bitget', 'bitmart'] else 1  # Adjust for exchanges requiring higher limits
     for i in range(3):
         from_c = cycle[i]
         to_c = cycle[(i + 1) % 3]
         pair = get_pair(ex, from_c, to_c)
-        if not pair:
+        if not pair or pair not in tickers:
             return None, None
         # Volume check
         if tickers[pair]['quoteVolume'] < min_volume:
             return None, None
         # Fetch order book if not cached
         if pair not in ob_cache:
-            ob_cache[pair] = ex.fetch_order_book(pair, limit=limit_val)
-            time.sleep(0.05)  # Small delay to avoid rate limits
+            try:
+                ob_cache[pair] = ex.fetch_order_book(pair, limit=limit_val)
+                time.sleep(0.1)  # Increased delay to avoid rate limits
+            except Exception:
+                return None, None
         ob = ob_cache[pair]
         if not ob['bids'] or not ob['asks']:
             return None, None
@@ -86,17 +89,19 @@ def calculate_profit(ex, tickers, ob_cache, cycle, fee, min_volume, trade_size):
 # Streamlit app
 st.title("Triangular Arbitrage Scanner")
 
-# UI inputs in a row
-col1, col2, col3, col4, col5 = st.columns(5)
+# UI inputs in a row (expanded for base currency)
+col1, col2, col3, col4, col5, col6 = st.columns(6)
 with col1:
     exchange_name = st.selectbox("Select Exchange", ["binance", "kraken", "kucoin", "bitfinex", "huobi", "gateio", "mexc", "bitget", "bybit", "bitmart"])
 with col2:
-    min_profit = st.number_input("Min Profit %", min_value=0.0, value=0.1, step=0.05)
+    base_currency = st.selectbox("Base Currency", ["USDT", "BTC", "ETH", "USD", "BNB"])
 with col3:
-    min_volume = st.number_input("Min 24h Volume", min_value=0, value=100000, step=10000)
+    min_profit = st.number_input("Min Profit %", min_value=0.0, value=0.1, step=0.05)
 with col4:
-    trade_size = st.number_input("Trade Size", min_value=0, value=1000, step=100)
+    min_volume = st.number_input("Min 24h Volume", min_value=0, value=100000, step=10000)
 with col5:
+    trade_size = st.number_input("Trade Size", min_value=0, value=1000, step=100)
+with col6:
     num_opp = st.selectbox("Num Opportunities", [10, 15, 20])
 
 # Scan button
@@ -105,16 +110,19 @@ if st.button("Scan for Opportunities"):
         try:
             ex = getattr(ccxt, exchange_name)()
             ex.load_markets()
-            triangles = find_triangles(ex.markets, ex)
+            triangles = find_triangles(ex.markets, ex, base_currency.upper())
             tickers = ex.fetch_tickers()
             
             # Get taker fee (fallback to 0.1% if not available)
-            first_market = list(ex.markets.keys())[0]
-            fee = ex.markets[first_market].get('taker', 0.001)
+            first_market = next((m for m in ex.markets if ex.markets[m].get('spot', False)), None)
+            if first_market:
+                fee = ex.markets[first_market].get('taker', 0.001)
+            else:
+                raise ValueError("No spot markets found on this exchange.")
             
             ob_cache = {}  # Cache for order books
             opps = []
-            for tri in triangles:
+            for tri in triangles[:500]:  # Limit to first 500 triangles to avoid rate limits
                 # Check both directions
                 for direction in [list(tri), list(tri)[::-1]]:
                     profit_before, profit_after = calculate_profit(ex, tickers, ob_cache, direction, fee, min_volume, trade_size)
