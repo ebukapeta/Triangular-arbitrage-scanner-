@@ -134,7 +134,7 @@ def calculate_profit(ex, tickers, ob_cache, cycle, fee, min_volume, trade_size, 
 # =========================
 # Streamlit UI
 # =========================
-st.title("Triangular Arbitrage Scanner — Show All Profits")
+st.title("Triangular Arbitrage Scanner + BTC Triangle Debug")
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -142,7 +142,7 @@ with col1:
 with col2:
     base_currency = st.selectbox("Base Currency", ["USDT", "BTC", "ETH", "USD", "BNB"])
 with col3:
-    min_profit = st.number_input("Min Profit % (highlight threshold)", min_value=0.0, value=0.0, step=0.01)
+    min_profit = st.number_input("Min Profit %", min_value=0.0, value=0.0, step=0.01)
 
 col4, col5, col6 = st.columns(3)
 with col4:
@@ -150,7 +150,7 @@ with col4:
 with col5:
     trade_size = st.number_input("Trade Size", min_value=0.0, value=200.0, step=50.0)
 with col6:
-    num_opp = st.selectbox("Num Opportunities to Display", [10, 15, 20, 30])
+    num_opp = st.selectbox("Num Opportunities", [10, 15, 20, 30])
 
 volume_filter_on = st.checkbox("Enable Volume Filtering", value=False)
 ob_limit = st.select_slider("Order Book Depth", options=[5, 10, 20, 40, 60, 100], value=40)
@@ -172,6 +172,12 @@ if st.button("Scan for Opportunities"):
             raw_count = len(triangles)
             triangles = triangles[:max_triangles]
             st.write(f"🔍 Raw triangles found: {raw_count} | Scanning: {len(triangles)}")
+
+            # Debug: Show all BTC triangles if BTC is base coin
+            if base_currency.upper() == "BTC":
+                btc_triangles = [tri for tri in triangles if "BTC" in tri]
+                st.subheader(f"BTC-related triangles found: {len(btc_triangles)}")
+                st.write(btc_triangles)  # This will let you check if ('BTC','USDT','VET') exists
 
             try:
                 tickers = ex.fetch_tickers()
@@ -201,18 +207,10 @@ if st.button("Scan for Opportunities"):
             if results:
                 results.sort(key=lambda x: x['Final Profit % (after fees)'], reverse=True)
                 top_all = results[:num_opp]
-                st.subheader(f"Top {num_opp} Cycles by Profit (may be below threshold)")
+                st.subheader(f"Top {num_opp} Cycles by Profit")
                 st.dataframe(pd.DataFrame(top_all), use_container_width=True)
-
-                # Highlight profitable above threshold
-                profitable = [r for r in results if r['Final Profit % (after fees)'] > min_profit]
-                if profitable:
-                    st.subheader("Profitable Above Threshold")
-                    st.dataframe(pd.DataFrame(profitable[:num_opp]), use_container_width=True)
-                else:
-                    st.info("No cycles above your threshold — but see all profits above.")
             else:
-                st.info("No triangles could be fully simulated (missing data or depth).")
+                st.info("No triangles produced results.")
 
         except ccxt.RateLimitExceeded:
             st.error("Rate limit exceeded. Try fewer triangles or higher delay.")
