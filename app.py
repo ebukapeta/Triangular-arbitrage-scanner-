@@ -7,7 +7,7 @@ import threading
 import asyncio
 import aiohttp
 import json
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, Optional
 
 # =========================================================
 # ---------------- WebSocket Order Book Manager -----------
@@ -30,17 +30,15 @@ class WSOrderBookManager:
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
 
-        # live cache + subscriptions
         self.books: Dict[Tuple[str, str], Dict] = {}
         self.subscribed: Dict[Tuple[str, str], bool] = {}
         self.lock = threading.Lock()
 
-        # KuCoin: dynamic endpoint (requires token)
+        # KuCoin token refresh
         self.kucoin_endpoint = None
         self.kucoin_token = None
         self.kucoin_token_expiry = 0
 
-    # ---------- event loop runner ----------
     def _run_loop(self):
         asyncio.set_event_loop(self.loop)
         self.loop.run_until_complete(self._ensure_session())
@@ -50,20 +48,9 @@ class WSOrderBookManager:
         if self.session is None or self.session.closed:
             self.session = aiohttp.ClientSession()
 
-    def close(self):
-        async def _close():
-            if self.session and not self.session.closed:
-                await self.session.close()
-        if self.loop.is_running():
-            asyncio.run_coroutine_threadsafe(_close(), self.loop)
-
-    # ---------- public API ----------
     def ensure_subscription(self, exchange: str, pair: str):
-        """
-        Ensure a (exchange, pair) is being streamed. Non-blocking.
-        """
         key = (exchange.lower(), pair)
-        if self.subscribed.get(key):  # already requested
+        if self.subscribed.get(key):
             return
         self.subscribed[key] = True
 
@@ -79,72 +66,50 @@ class WSOrderBookManager:
             asyncio.run_coroutine_threadsafe(
                 self._bybit_subscribe(pair), self.loop
             )
-        else:
-            # Not supported (REST will be used)
-            pass
 
     def get_book(self, exchange: str, pair: str) -> Optional[Dict]:
         with self.lock:
             return self.books.get((exchange.lower(), pair))
 
-    # =====================================================
-    # -------------------- BINANCE WS ---------------------
-    # =====================================================
+    # ---------------- Binance ----------------
     async def _binance_subscribe(self, pair: str):
-        """
-        Subscribe to Binance spot partial depth for a symbol (pair like 'VET/USDT').
-        Uses stream: wss://stream.binance.com:9443/ws
-        """
         await self._ensure_session()
-        symbol = pair.replace("/", "").lower()  # e.g. BTC/USDT -> btcusdt
+        symbol = pair.replace("/", "").lower()
         depth_tag = f"{symbol}@depth{self.depth_levels}@100ms"
         url = "wss://stream.binance.com:9443/ws"
 
         async def listen():
             try:
                 async with self.session.ws_connect(url, heartbeat=30) as ws:
-                    # Subscribe
                     sub_msg = {
                         "method": "SUBSCRIBE",
                         "params": [depth_tag],
                         "id": int(time.time()*1000) % 10_000_000
                     }
                     await ws.send_json(sub_msg)
-
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             data = json.loads(msg.data)
-                            # depth update: 'b' = bids, 'a' = asks (arrays of [price, qty])
                             if 'b' in data and 'a' in data:
                                 bids = [(float(p), float(q)) for p, q in data.get('b', [])][:self.depth_levels]
                                 asks = [(float(p), float(q)) for p, q in data.get('a', [])][:self.depth_levels]
                                 with self.lock:
-                                    self.books[("binance", pair)] = {
-                                        "bids": bids, "asks": asks, "ts": int(time.time()*1000)
-                                    }
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            break
+                                    self.books[("binance", pair)] = {"bids": bids, "asks": asks, "ts": int(time.time()*1000)}
             except Exception:
-                # backoff and retry
                 await asyncio.sleep(1.5)
                 asyncio.create_task(listen())
-
         asyncio.create_task(listen())
 
-    # =====================================================
-    # --------------------- KUCOIN WS ---------------------
-    # =====================================================
+    # ---------------- KuCoin ----------------
     async def _kucoin_public_token(self):
-        # Get KuCoin public bullet
         await self._ensure_session()
         try:
             async with self.session.post("https://api.kucoin.com/api/v1/bullet-public") as resp:
                 j = await resp.json()
                 token = j["data"]["token"]
-                # pick first server
                 endpoint = j["data"]["instanceServers"][0]["endpoint"]
-                pingInterval = j["data"]["instanceServers"][0]["pingInterval"]  # ms
-                expireTime = j["data"]["instanceServers"][0]["expireTime"]      # ms
+                pingInterval = j["data"]["instanceServers"][0]["pingInterval"]
+                expireTime = j["data"]["instanceServers"][0]["expireTime"]
                 self.kucoin_endpoint = endpoint
                 self.kucoin_token = token
                 self.kucoin_token_expiry = int(time.time()*1000) + (expireTime or 60_000)
@@ -153,26 +118,19 @@ class WSOrderBookManager:
             return None, None, None
 
     async def _kucoin_subscribe(self, pair: str):
-        """
-        Subscribe to KuCoin spot partial depth 5 or 20 for symbol like 'VET-USDT'
-        KuCoin symbol format uses hyphen.
-        """
         await self._ensure_session()
         endpoint, token, ping_ms = await self._kucoin_public_token()
         if not endpoint or not token:
-            # Retry later
             await asyncio.sleep(2)
             asyncio.create_task(self._kucoin_subscribe(pair))
             return
 
-        # Convert symbol: e.g. VET/USDT -> VET-USDT
         symbol = pair.replace("/", "-").upper()
         url = f"{endpoint}?token={token}"
 
         async def listen():
             try:
                 async with self.session.ws_connect(url, heartbeat=max(10, (ping_ms or 20000)//1000)) as ws:
-                    # Join channel market level2Depth{depth}
                     depth_ch = "level2Depth5" if self.depth_levels <= 5 else "level2Depth20"
                     sub = {
                         "id": str(int(time.time()*1000)),
@@ -183,7 +141,6 @@ class WSOrderBookManager:
                     }
                     await ws.send_json(sub)
 
-                    # Ping loop
                     async def pinger():
                         while True:
                             try:
@@ -191,7 +148,6 @@ class WSOrderBookManager:
                             except Exception:
                                 break
                             await asyncio.sleep(max(5, (ping_ms or 20000)/1000.0 - 2))
-
                     asyncio.create_task(pinger())
 
                     async for msg in ws:
@@ -199,31 +155,17 @@ class WSOrderBookManager:
                             data = json.loads(msg.data)
                             if data.get("type") == "message" and "data" in data:
                                 d = data["data"]
-                                # d has 'bids': [[price, size], ...], 'asks': [[price, size], ...]
                                 bids = [(float(p), float(q)) for p, q in d.get("bids", [])][:self.depth_levels]
                                 asks = [(float(p), float(q)) for p, q in d.get("asks", [])][:self.depth_levels]
                                 with self.lock:
-                                    self.books[("kucoin", pair)] = {
-                                        "bids": bids, "asks": asks, "ts": d.get("time", int(time.time()*1000))
-                                    }
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            break
+                                    self.books[("kucoin", pair)] = {"bids": bids, "asks": asks, "ts": d.get("time", int(time.time()*1000))}
             except Exception:
                 await asyncio.sleep(1.5)
                 asyncio.create_task(listen())
-
         asyncio.create_task(listen())
 
-    # =====================================================
-    # ---------------------- BYBIT WS ---------------------
-    # =====================================================
+    # ---------------- Bybit ----------------
     async def _bybit_subscribe(self, pair: str):
-        """
-        Bybit Spot public WS v5:
-          wss://stream.bybit.com/v5/public/spot
-        Topic: orderbook. Use depth = 50 (we'll slice to depth_levels).
-        Symbol: e.g. VETUSDT
-        """
         await self._ensure_session()
         url = "wss://stream.bybit.com/v5/public/spot"
         symbol = pair.replace("/", "").upper()
@@ -231,36 +173,25 @@ class WSOrderBookManager:
         async def listen():
             try:
                 async with self.session.ws_connect(url, heartbeat=30) as ws:
-                    sub = {
-                        "op": "subscribe",
-                        "args": [f"orderbook.50.{symbol}"]
-                    }
+                    sub = {"op": "subscribe", "args": [f"orderbook.50.{symbol}"]}
                     await ws.send_json(sub)
-
                     async for msg in ws:
                         if msg.type == aiohttp.WSMsgType.TEXT:
                             data = json.loads(msg.data)
-                            # Snapshot or delta messages under "data" -> "b" (bids), "a" (asks), each [price, size]
                             if data.get("topic", "").startswith("orderbook") and "data" in data:
                                 d = data["data"]
-                                # Bybit might send dict with 'b'/'a' lists
                                 bids = [(float(p), float(q)) for p, q in d.get("b", [])][:self.depth_levels]
                                 asks = [(float(p), float(q)) for p, q in d.get("a", [])][:self.depth_levels]
                                 if bids or asks:
                                     with self.lock:
-                                        self.books[("bybit", pair)] = {
-                                            "bids": bids, "asks": asks, "ts": int(time.time()*1000)
-                                        }
-                        elif msg.type == aiohttp.WSMsgType.ERROR:
-                            break
+                                        self.books[("bybit", pair)] = {"bids": bids, "asks": asks, "ts": int(time.time()*1000)}
             except Exception:
                 await asyncio.sleep(1.5)
                 asyncio.create_task(listen())
-
         asyncio.create_task(listen())
 
 
-# Create a singleton WS manager for the Streamlit session (cached across reruns)
+# Streamlit cache for WS manager
 @st.cache_resource
 def get_ws_manager(depth_levels: int):
     return WSOrderBookManager(depth_levels=depth_levels)
@@ -334,9 +265,6 @@ def fill_buy_base_with_quote(amount_quote, orderbook_asks):
     return base_bought, spent_quote
 
 def calc_profit_with_books(cycle, fee, trade_size, book_fetcher, ob_limit):
-    """
-    book_fetcher(exchange, pair) -> orderbook dict with 'bids'/'asks'
-    """
     amount = float(trade_size)
     initial = amount
     before_product = 1.0
@@ -346,7 +274,7 @@ def calc_profit_with_books(cycle, fee, trade_size, book_fetcher, ob_limit):
     for i in range(3):
         from_c = cycle[i]
         to_c = cycle[(i + 1) % 3]
-        pair, ob, side = book_fetcher(from_c, to_c)
+        pair, ob, source = book_fetcher(from_c, to_c)
         if pair is None or ob is None:
             return None, None, 0.0, "Missing data"
 
@@ -358,7 +286,6 @@ def calc_profit_with_books(cycle, fee, trade_size, book_fetcher, ob_limit):
         base, quote = pair.split('/')
 
         if base == from_c and quote == to_c:
-            # Sell base -> quote (use bids)
             quote_recv, filled_base = fill_sell_base_for_quote(amount, bids)
             if filled_base + 1e-12 < amount:
                 full_fill = False
@@ -368,7 +295,6 @@ def calc_profit_with_books(cycle, fee, trade_size, book_fetcher, ob_limit):
             amount = quote_recv * (1.0 - fee)
 
         elif base == to_c and quote == from_c:
-            # Buy base with quote (use asks)
             base_bought, spent_quote = fill_buy_base_with_quote(amount, asks)
             if spent_quote + 1e-12 < amount:
                 full_fill = False
@@ -412,10 +338,6 @@ max_triangles = st.number_input("Max Triangles to Scan", min_value=30, max_value
 # Create/get WS manager with chosen depth
 ws_manager = get_ws_manager(depth_levels=min(50, max(5, ob_limit)))
 
-# =========================================================
-# -------------- Helper: building book fetcher ------------
-# =========================================================
-
 def build_book_fetcher(ex, exch_name: str, ob_cache_rest: dict):
     exlower = exch_name.lower()
 
@@ -424,39 +346,29 @@ def build_book_fetcher(ex, exch_name: str, ob_cache_rest: dict):
         if not pair:
             return None, None, None
 
-        # If exchange supports WS, ensure subscription and read cache
         if exlower in ("binance", "kucoin", "bybit"):
-            # Ask WS manager to subscribe (non-blocking)
             ws_manager.ensure_subscription(exlower, pair)
-
-            # Try to get a fresh snapshot from cache; wait briefly
             start = time.time()
             book = None
-            while time.time() - start < 1.2:  # wait up to ~1.2s for first snapshot
+            while time.time() - start < 1.2:
                 book = ws_manager.get_book(exlower, pair)
                 if book and book.get("bids") and book.get("asks"):
                     break
                 time.sleep(0.05)
-
             if book and book.get("bids") and book.get("asks"):
                 return pair, book, "ws"
-
-            # Fallback to REST if WS not yet ready
             try:
                 if pair not in ob_cache_rest:
                     ob_cache_rest[pair] = ex.fetch_order_book(pair, limit=ob_limit)
                 ob = ob_cache_rest[pair]
-                # Convert to our (price, amount) list format
                 bids = [(float(p), float(q)) for p, q in ob.get("bids", [])][:ob_limit]
                 asks = [(float(p), float(q)) for p, q in ob.get("asks", [])][:ob_limit]
                 if bids and asks:
                     return pair, {"bids": bids, "asks": asks, "ts": ob.get("timestamp", int(time.time()*1000))}, "rest-fallback"
             except Exception:
                 return None, None, None
-
             return None, None, None
 
-        # Non-WS exchanges: REST only (with simple cache)
         try:
             if pair not in ob_cache_rest:
                 ob_cache_rest[pair] = ex.fetch_order_book(pair, limit=ob_limit)
@@ -467,16 +379,64 @@ def build_book_fetcher(ex, exch_name: str, ob_cache_rest: dict):
                 return pair, {"bids": bids, "asks": asks, "ts": ob.get("timestamp", int(time.time()*1000))}, "rest"
         except Exception:
             return None, None, None
-
         return None, None, None
-
     return fetch_from_ws_or_rest
 
-# =========================================================
-# -------------------------- Scan -------------------------
-# =========================================================
 if st.button("Scan for Opportunities"):
     with st.spinner("Scanning..."):
         try:
             ex = getattr(ccxt, exchange_name)()
-            ex.enableRateLimit 
+            ex.enableRateLimit = True   # ✅ FIXED
+            ex.load_markets()
+
+            triangles = find_triangles(ex.markets, base_currency.upper())
+            total_raw = len(triangles)
+            triangles = triangles[:max_triangles]
+            st.write(f"🔍 Static triangles (from listings): {total_raw} | Scanning: {len(triangles)}")
+
+            first_market = next((m for m in ex.markets if ex.markets[m].get('spot', False)), None)
+            fee = ex.markets[first_market].get('taker', 0.001) if first_market else 0.001
+
+            ob_cache_rest: Dict[str, dict] = {}
+            book_fetcher = build_book_fetcher(ex, exchange_name, ob_cache_rest)
+
+            results = []
+            for tri in triangles:
+                for direction in [list(tri), list(tri)[::-1]]:
+                    pb, pa, fill_pct, reason = calc_profit_with_books(direction, fee, trade_size, book_fetcher, ob_limit)
+                    if pb is not None and pa is not None:
+                        results.append({
+                            "Coin Pairs": " -> ".join(direction) + f" -> {direction[0]}",
+                            "Initial Profit % (before fees)": pb,
+                            "Final Profit % (after fees)": pa,
+                            "Fill % of Trade Size": fill_pct,
+                            "Reason": reason,
+                            "Fee % (total)": round(fee * 3 * 100, 6)
+                        })
+
+            if results:
+                results.sort(key=lambda x: x["Final Profit % (after fees)"], reverse=True)
+                st.subheader(f"Top {num_opp} Cycles (WS for {exchange_name} if available)")
+                st.dataframe(pd.DataFrame(results[:num_opp]), use_container_width=True)
+
+                profitable = [
+                    r for r in results
+                    if r["Final Profit % (after fees)"] > min_profit and r["Reason"] == "OK"
+                ]
+                if profitable:
+                    st.subheader("Profitable & Fully Fillable Above Threshold")
+                    st.dataframe(pd.DataFrame(profitable[:num_opp]), use_container_width=True)
+                else:
+                    st.info("No fully fillable cycles above threshold — check partial results above.")
+            else:
+                st.info("No triangles produced results (missing data or zero depth).")
+
+        except ccxt.RateLimitExceeded:
+            st.error("Rate limit exceeded (REST). For Binance/KuCoin/Bybit we already use WS; try fewer triangles.")
+        except Exception as e:
+            st.error(f"Error: {e}")
+
+st.caption(
+    "Tip: Binance/KuCoin/Bybit use WebSockets for live order books. Others use REST. "
+    "If a WS snapshot isn’t ready yet, the scanner falls back to REST for that pair."
+)
