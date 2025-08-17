@@ -16,12 +16,7 @@ from typing import Dict, Tuple, Optional
 class WSOrderBookManager:
     """
     Live order book cache for Binance, KuCoin, Bybit via native WebSockets.
-    For other exchanges, use REST (outside this class).
-
-    Cache structure:
-      self.books[(exchange, pair)] = {"bids": [(price, amount), ...],
-                                      "asks": [(price, amount), ...],
-                                      "ts": int_millis}
+    For other exchanges, we fall back to REST.
     """
     def __init__(self, depth_levels: int = 20):
         self.depth_levels = depth_levels
@@ -34,7 +29,7 @@ class WSOrderBookManager:
         self.subscribed: Dict[Tuple[str, str], bool] = {}
         self.lock = threading.Lock()
 
-        # KuCoin token refresh
+        # KuCoin token
         self.kucoin_endpoint = None
         self.kucoin_token = None
         self.kucoin_token_expiry = 0
@@ -190,8 +185,7 @@ class WSOrderBookManager:
                 asyncio.create_task(listen())
         asyncio.create_task(listen())
 
-
-# Streamlit cache for WS manager
+# Cache resource for WS manager
 @st.cache_resource
 def get_ws_manager(depth_levels: int):
     return WSOrderBookManager(depth_levels=depth_levels)
@@ -226,6 +220,9 @@ def find_triangles(markets, base_currency):
                     if base_currency in tri and tri not in triangles:
                         triangles.append(tri)
     return triangles
+    # =========================================================
+# ---------------- Order Book & Profit Helpers ------------
+# =========================================================
 
 def get_pair(ex, a, b):
     p1 = f"{a}/{b}"
@@ -338,6 +335,7 @@ max_triangles = st.number_input("Max Triangles to Scan", min_value=30, max_value
 # Create/get WS manager with chosen depth
 ws_manager = get_ws_manager(depth_levels=min(50, max(5, ob_limit)))
 
+# ---------------- Build Book Fetcher ----------------
 def build_book_fetcher(ex, exch_name: str, ob_cache_rest: dict):
     exlower = exch_name.lower()
 
@@ -348,15 +346,13 @@ def build_book_fetcher(ex, exch_name: str, ob_cache_rest: dict):
 
         if exlower in ("binance", "kucoin", "bybit"):
             ws_manager.ensure_subscription(exlower, pair)
-            start = time.time()
-            book = None
-            while time.time() - start < 1.2:
-                book = ws_manager.get_book(exlower, pair)
-                if book and book.get("bids") and book.get("asks"):
-                    break
-                time.sleep(0.05)
+
+            # ✅ Try WS cache immediately (don't block)
+            book = ws_manager.get_book(exlower, pair)
             if book and book.get("bids") and book.get("asks"):
                 return pair, book, "ws"
+
+            # ✅ Fallback to REST if no WS snapshot yet
             try:
                 if pair not in ob_cache_rest:
                     ob_cache_rest[pair] = ex.fetch_order_book(pair, limit=ob_limit)
@@ -369,6 +365,7 @@ def build_book_fetcher(ex, exch_name: str, ob_cache_rest: dict):
                 return None, None, None
             return None, None, None
 
+        # ✅ All other exchanges = REST only
         try:
             if pair not in ob_cache_rest:
                 ob_cache_rest[pair] = ex.fetch_order_book(pair, limit=ob_limit)
@@ -380,13 +377,15 @@ def build_book_fetcher(ex, exch_name: str, ob_cache_rest: dict):
         except Exception:
             return None, None, None
         return None, None, None
+
     return fetch_from_ws_or_rest
 
+# ---------------- Scan Button ----------------
 if st.button("Scan for Opportunities"):
     with st.spinner("Scanning..."):
         try:
             ex = getattr(ccxt, exchange_name)()
-            ex.enableRateLimit = True   # ✅ FIXED
+            ex.enableRateLimit = True
             ex.load_markets()
 
             triangles = find_triangles(ex.markets, base_currency.upper())
@@ -439,4 +438,4 @@ if st.button("Scan for Opportunities"):
 st.caption(
     "Tip: Binance/KuCoin/Bybit use WebSockets for live order books. Others use REST. "
     "If a WS snapshot isn’t ready yet, the scanner falls back to REST for that pair."
-)
+    )
