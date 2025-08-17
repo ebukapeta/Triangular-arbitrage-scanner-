@@ -191,10 +191,10 @@ def get_ws_manager(depth_levels: int):
     return WSOrderBookManager(depth_levels=depth_levels)
 
 # =========================================================
-# ---------------- Triangle/Profit Utilities --------------
+# ---------------- Triangle Finder ------------------------
 # =========================================================
 
-def find_triangles(markets, base_currency):
+def find_triangles(markets):
     graph = defaultdict(set)
     currencies = set()
 
@@ -217,11 +217,11 @@ def find_triangles(markets, base_currency):
                 n1, n2 = neighbors[i], neighbors[j]
                 if n2 in graph[n1]:
                     tri = tuple(sorted([node, n1, n2]))
-                    if base_currency in tri and tri not in triangles:
+                    if tri not in triangles:
                         triangles.append(tri)
     return triangles
     # =========================================================
-# ---------------- Order Book & Profit Helpers ------------
+# ---------------- Profit Calculation ---------------------
 # =========================================================
 
 def get_pair(ex, a, b):
@@ -233,106 +233,60 @@ def get_pair(ex, a, b):
         return p2
     return None
 
-def fill_sell_base_for_quote(amount_base, orderbook_bids):
-    remaining = float(amount_base)
-    quote_received = 0.0
-    filled_base = 0.0
-    for price, vol_base in orderbook_bids:
-        if remaining <= 0:
-            break
-        trade_base = min(remaining, vol_base)
-        quote_received += trade_base * price
-        remaining -= trade_base
-        filled_base += trade_base
-    return quote_received, filled_base
-
-def fill_buy_base_with_quote(amount_quote, orderbook_asks):
-    remaining_quote = float(amount_quote)
-    base_bought = 0.0
-    spent_quote = 0.0
-    for price, vol_base in orderbook_asks:
-        if remaining_quote <= 0:
-            break
-        max_base_affordable = remaining_quote / price
-        trade_base = min(vol_base, max_base_affordable)
-        cost = trade_base * price
-        base_bought += trade_base
-        spent_quote += cost
-        remaining_quote -= cost
-    return base_bought, spent_quote
-
-def calc_profit_with_books(cycle, fee, trade_size, book_fetcher, ob_limit):
-    amount = float(trade_size)
-    initial = amount
-    before_product = 1.0
-    reason = "OK"
-    full_fill = True
-
+def calc_profit_best_bidask(cycle, fee, book_fetcher):
+    amount_ratio = 1.0
+    before_ratio = 1.0
     for i in range(3):
         from_c = cycle[i]
         to_c = cycle[(i + 1) % 3]
         pair, ob, source = book_fetcher(from_c, to_c)
         if pair is None or ob is None:
-            return None, None, 0.0, "Missing data"
+            return None, None, "Missing data"
 
-        bids = ob.get("bids", [])[:ob_limit]
-        asks = ob.get("asks", [])[:ob_limit]
+        bids = ob.get("bids", [])
+        asks = ob.get("asks", [])
         if not bids or not asks:
-            return None, None, 0.0, "No liquidity"
+            return None, None, "No liquidity"
 
         base, quote = pair.split('/')
 
         if base == from_c and quote == to_c:
-            quote_recv, filled_base = fill_sell_base_for_quote(amount, bids)
-            if filled_base + 1e-12 < amount:
-                full_fill = False
-                reason = "Insufficient depth"
-            ratio_pre_fee = (quote_recv / amount) if amount > 0 else 0.0
-            before_product *= ratio_pre_fee
-            amount = quote_recv * (1.0 - fee)
-
+            # sell base → get quote, use best bid
+            bid_price = bids[0][0]
+            before_ratio *= bid_price
+            amount_ratio *= bid_price * (1 - fee)
         elif base == to_c and quote == from_c:
-            base_bought, spent_quote = fill_buy_base_with_quote(amount, asks)
-            if spent_quote + 1e-12 < amount:
-                full_fill = False
-                reason = "Insufficient depth"
-            ratio_pre_fee = (base_bought / amount) if amount > 0 else 0.0
-            before_product *= ratio_pre_fee
-            amount = base_bought * (1.0 - fee)
+            # buy base with quote, use best ask
+            ask_price = asks[0][0]
+            before_ratio *= (1.0 / ask_price)
+            amount_ratio *= (1.0 / ask_price) * (1 - fee)
         else:
-            return None, None, 0.0, "Pair mismatch"
+            return None, None, "Pair mismatch"
 
-    profit_before = (before_product - 1.0) * 100.0
-    profit_after = ((amount / initial) - 1.0) * 100.0
-    fill_pct = (amount / initial) * 100.0
-    return round(profit_before, 6), round(profit_after, 6), round(fill_pct, 2), ("OK" if full_fill else reason)
+    profit_before = (before_ratio - 1.0) * 100.0
+    profit_after = (amount_ratio - 1.0) * 100.0
+    return round(profit_before, 6), round(profit_after, 6), "OK"
 
 # =========================================================
 # ----------------------- Streamlit UI --------------------
 # =========================================================
-st.set_page_config(page_title="Triangular Arbitrage (WS + REST)", layout="wide")
-st.title("Triangular Arbitrage Scanner — WebSockets (Binance/KuCoin/Bybit) + REST (others)")
+st.set_page_config(page_title="Triangular Arbitrage Scanner", layout="wide")
+st.title("Triangular Arbitrage Scanner — Spot Market Only")
 
 c1, c2, c3 = st.columns(3)
 with c1:
-    exchange_name = st.selectbox("Exchange", ["binance", "kucoin", "bybit", "kraken", "bitfinex", "huobi", "gateio", "mexc", "bitget", "bitmart"])
+    exchange_name = st.selectbox("Exchange", [
+        "binance", "kucoin", "bybit", "kraken", "bitfinex", "huobi",
+        "gateio", "mexc", "bitget", "bitmart"
+    ])
 with c2:
-    base_currency = st.selectbox("Base Currency", ["USDT", "BTC", "ETH", "USD", "BNB"])
-with c3:
     min_profit = st.number_input("Highlight Profit % Threshold", min_value=0.0, value=0.0, step=0.01)
+with c3:
+    ob_limit = st.select_slider("Order Book Depth (levels)", options=[5, 10, 20, 40, 60, 100], value=5)
 
-c4, c5, c6 = st.columns(3)
-with c4:
-    trade_size = st.number_input("Trade Size", min_value=0.0, value=200.0, step=50.0)
-with c5:
-    num_opp = st.selectbox("Show Top N", [10, 15, 20, 30])
-with c6:
-    ob_limit = st.select_slider("Order Book Depth (levels)", options=[5, 10, 20, 40, 60, 100], value=20)
+max_triangles = st.number_input("Max Triangles to Scan", min_value=30, max_value=2000, value=300, step=50)
 
-max_triangles_default = 120 if exchange_name.lower() in ("binance", "kucoin", "bybit") else 300
-max_triangles = st.number_input("Max Triangles to Scan", min_value=30, max_value=1000, value=max_triangles_default, step=30)
-
-# Create/get WS manager with chosen depth
+# Create/get WS manager
 ws_manager = get_ws_manager(depth_levels=min(50, max(5, ob_limit)))
 
 # ---------------- Build Book Fetcher ----------------
@@ -347,12 +301,12 @@ def build_book_fetcher(ex, exch_name: str, ob_cache_rest: dict):
         if exlower in ("binance", "kucoin", "bybit"):
             ws_manager.ensure_subscription(exlower, pair)
 
-            # ✅ Try WS cache immediately (don't block)
+            # ✅ Try WS cache immediately
             book = ws_manager.get_book(exlower, pair)
             if book and book.get("bids") and book.get("asks"):
                 return pair, book, "ws"
 
-            # ✅ Fallback to REST if no WS snapshot yet
+            # ✅ Fallback to REST if WS not ready
             try:
                 if pair not in ob_cache_rest:
                     ob_cache_rest[pair] = ex.fetch_order_book(pair, limit=ob_limit)
@@ -365,7 +319,7 @@ def build_book_fetcher(ex, exch_name: str, ob_cache_rest: dict):
                 return None, None, None
             return None, None, None
 
-        # ✅ All other exchanges = REST only
+        # ✅ REST only for other exchanges
         try:
             if pair not in ob_cache_rest:
                 ob_cache_rest[pair] = ex.fetch_order_book(pair, limit=ob_limit)
@@ -388,12 +342,14 @@ if st.button("Scan for Opportunities"):
             ex.enableRateLimit = True
             ex.load_markets()
 
-            triangles = find_triangles(ex.markets, base_currency.upper())
+            # spot-only
+            spot_markets = {s: m for s, m in ex.markets.items() if m.get("spot", False)}
+            triangles = find_triangles(spot_markets)
             total_raw = len(triangles)
             triangles = triangles[:max_triangles]
-            st.write(f"🔍 Static triangles (from listings): {total_raw} | Scanning: {len(triangles)}")
+            st.write(f"🔍 Found {total_raw} unique spot triangles. Scanning {len(triangles)}...")
 
-            first_market = next((m for m in ex.markets if ex.markets[m].get('spot', False)), None)
+            first_market = next((m for m in spot_markets) if spot_markets else None)
             fee = ex.markets[first_market].get('taker', 0.001) if first_market else 0.001
 
             ob_cache_rest: Dict[str, dict] = {}
@@ -402,40 +358,39 @@ if st.button("Scan for Opportunities"):
             results = []
             for tri in triangles:
                 for direction in [list(tri), list(tri)[::-1]]:
-                    pb, pa, fill_pct, reason = calc_profit_with_books(direction, fee, trade_size, book_fetcher, ob_limit)
+                    pb, pa, reason = calc_profit_best_bidask(direction, fee, book_fetcher)
                     if pb is not None and pa is not None:
                         results.append({
                             "Coin Pairs": " -> ".join(direction) + f" -> {direction[0]}",
                             "Profit % BEFORE Fees": pb,
                             "Profit % AFTER Fees": pa,
-                            "Fill % of Trade Size": fill_pct,
                             "Reason": reason,
                             "Fee % (total)": round(fee * 3 * 100, 6)
                         })
 
             if results:
                 results.sort(key=lambda x: x["Profit % AFTER Fees"], reverse=True)
-                st.subheader(f"Top {num_opp} Cycles (WS for {exchange_name} if available)")
-                st.dataframe(pd.DataFrame(results[:num_opp]), use_container_width=True)
+                st.subheader(f"Top {min(len(results), 20)} Cycles")
+                st.dataframe(pd.DataFrame(results[:20]), use_container_width=True)
 
                 profitable = [
                     r for r in results
                     if r["Profit % AFTER Fees"] > min_profit and r["Reason"] == "OK"
                 ]
                 if profitable:
-                    st.subheader("Profitable & Fully Fillable Above Threshold")
-                    st.dataframe(pd.DataFrame(profitable[:num_opp]), use_container_width=True)
+                    st.subheader("Profitable Above Threshold")
+                    st.dataframe(pd.DataFrame(profitable[:20]), use_container_width=True)
                 else:
-                    st.info("No fully fillable cycles above threshold — check raw vs after-fee results above.")
+                    st.info("No profitable cycles above threshold.")
             else:
-                st.info("No triangles produced results (missing data or zero depth).")
+                st.info("No cycles produced results.")
 
         except ccxt.RateLimitExceeded:
-            st.error("Rate limit exceeded (REST). For Binance/KuCoin/Bybit we already use WS; try fewer triangles.")
+            st.error("Rate limit exceeded. For Binance/KuCoin/Bybit, WebSockets are used to reduce this.")
         except Exception as e:
             st.error(f"Error: {e}")
 
 st.caption(
-    "Tip: Binance/KuCoin/Bybit use WebSockets for live order books. Others use REST. "
-    "We now show both profit BEFORE fees and AFTER fees so you can compare raw vs net opportunities."
+    "Now scanning all SPOT markets only. Shows both raw (before fees) and net (after fees) profit. "
+    "Binance/KuCoin/Bybit use WebSockets; others use REST."
         )
