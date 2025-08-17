@@ -406,27 +406,27 @@ if st.button("Scan for Opportunities"):
                     if pb is not None and pa is not None:
                         results.append({
                             "Coin Pairs": " -> ".join(direction) + f" -> {direction[0]}",
-                            "Initial Profit % (before fees)": pb,
-                            "Final Profit % (after fees)": pa,
+                            "Profit % BEFORE Fees": pb,
+                            "Profit % AFTER Fees": pa,
                             "Fill % of Trade Size": fill_pct,
                             "Reason": reason,
                             "Fee % (total)": round(fee * 3 * 100, 6)
                         })
 
             if results:
-                results.sort(key=lambda x: x["Final Profit % (after fees)"], reverse=True)
+                results.sort(key=lambda x: x["Profit % AFTER Fees"], reverse=True)
                 st.subheader(f"Top {num_opp} Cycles (WS for {exchange_name} if available)")
                 st.dataframe(pd.DataFrame(results[:num_opp]), use_container_width=True)
 
                 profitable = [
                     r for r in results
-                    if r["Final Profit % (after fees)"] > min_profit and r["Reason"] == "OK"
+                    if r["Profit % AFTER Fees"] > min_profit and r["Reason"] == "OK"
                 ]
                 if profitable:
                     st.subheader("Profitable & Fully Fillable Above Threshold")
                     st.dataframe(pd.DataFrame(profitable[:num_opp]), use_container_width=True)
                 else:
-                    st.info("No fully fillable cycles above threshold — check partial results above.")
+                    st.info("No fully fillable cycles above threshold — check raw vs after-fee results above.")
             else:
                 st.info("No triangles produced results (missing data or zero depth).")
 
@@ -437,5 +437,5 @@ if st.button("Scan for Opportunities"):
 
 st.caption(
     "Tip: Binance/KuCoin/Bybit use WebSockets for live order books. Others use REST. "
-    "If a WS snapshot isn’t ready yet, the scanner falls back to REST for that pair."
-    )
+    "We now show both profit BEFORE fees and AFTER fees so you can compare raw vs net opportunities."
+        )
