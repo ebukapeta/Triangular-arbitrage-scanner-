@@ -1,3 +1,4 @@
+# app.py — Part 1/2
 import streamlit as st
 import ccxt
 from collections import defaultdict
@@ -11,12 +12,15 @@ from typing import Dict, Tuple, Optional
 
 # =========================================================
 # ---------------- WebSocket Order Book Manager -----------
+# (Kept for parity with your existing code; not needed when
+#  using market price/last for profit calc.)
 # =========================================================
 
 class WSOrderBookManager:
     """
     Live order book cache for Binance, KuCoin, Bybit via native WebSockets.
-    For other exchanges, we fall back to REST.
+    For other exchanges, we fall back to REST. (Not used by the
+    market-price scanner, but retained to match your file.)
     """
     def __init__(self, depth_levels: int = 20):
         self.depth_levels = depth_levels
@@ -185,7 +189,7 @@ class WSOrderBookManager:
                 asyncio.create_task(listen())
         asyncio.create_task(listen())
 
-# Cache resource for WS manager
+# Cache resource for WS manager (not used by market-price calc, kept for parity)
 @st.cache_resource
 def get_ws_manager(depth_levels: int):
     return WSOrderBookManager(depth_levels=depth_levels)
@@ -193,6 +197,13 @@ def get_ws_manager(depth_levels: int):
 # =========================================================
 # ---------------- Triangle Finder ------------------------
 # =========================================================
+
+def split_symbol(sym: str):
+    # Handle symbols like 'BTC/USDT:USDT' → ('BTC','USDT')
+    parts = sym.split("/")
+    base = parts[0]
+    quote = parts[1].split(":")[0] if len(parts) > 1 else ""
+    return base, quote
 
 def find_triangles(markets):
     graph = defaultdict(set)
@@ -220,9 +231,6 @@ def find_triangles(markets):
                     if tri not in triangles:
                         triangles.append(tri)
     return triangles
-    # =========================================================
-# ---------------- Profit Calculation ---------------------
-# =========================================================
 
 def get_pair(ex, a, b):
     p1 = f"{a}/{b}"
@@ -233,45 +241,11 @@ def get_pair(ex, a, b):
         return p2
     return None
 
-def calc_profit_best_bidask(cycle, fee, book_fetcher):
-    amount_ratio = 1.0
-    before_ratio = 1.0
-    for i in range(3):
-        from_c = cycle[i]
-        to_c = cycle[(i + 1) % 3]
-        pair, ob, source = book_fetcher(from_c, to_c)
-        if pair is None or ob is None:
-            return None, None, "Missing data"
-
-        bids = ob.get("bids", [])
-        asks = ob.get("asks", [])
-        if not bids or not asks:
-            return None, None, "No liquidity"
-
-        base, quote = pair.split('/')
-
-        if base == from_c and quote == to_c:
-            # sell base → get quote, use best bid
-            bid_price = bids[0][0]
-            before_ratio *= bid_price
-            amount_ratio *= bid_price * (1 - fee)
-        elif base == to_c and quote == from_c:
-            # buy base with quote, use best ask
-            ask_price = asks[0][0]
-            before_ratio *= (1.0 / ask_price)
-            amount_ratio *= (1.0 / ask_price) * (1 - fee)
-        else:
-            return None, None, "Pair mismatch"
-
-    profit_before = (before_ratio - 1.0) * 100.0
-    profit_after = (amount_ratio - 1.0) * 100.0
-    return round(profit_before, 6), round(profit_after, 6), "OK"
-
 # =========================================================
 # ----------------------- Streamlit UI --------------------
 # =========================================================
 st.set_page_config(page_title="Triangular Arbitrage Scanner", layout="wide")
-st.title("Triangular Arbitrage Scanner — Spot Market Only")
+st.title("Triangular Arbitrage Scanner — Spot Market Only (Market Price)")
 
 c1, c2, c3 = st.columns(3)
 with c1:
@@ -282,61 +256,98 @@ with c1:
 with c2:
     min_profit = st.number_input("Highlight Profit % Threshold", min_value=0.0, value=0.0, step=0.01)
 with c3:
-    ob_limit = st.select_slider("Order Book Depth (levels)", options=[5, 10, 20, 40, 60, 100], value=5)
+    max_triangles = st.number_input("Max Triangles to Scan", min_value=30, max_value=5000, value=600, step=50)
 
-max_triangles = st.number_input("Max Triangles to Scan", min_value=30, max_value=2000, value=300, step=50)
+# (WS manager kept for parity; not used by market-price calc)
+ws_manager = get_ws_manager(depth_levels=20)
 
-# Create/get WS manager
-ws_manager = get_ws_manager(depth_levels=min(50, max(5, ob_limit)))
+show_leg_prices = st.checkbox("Show leg market prices (debug)", value=False)
+scan_btn = st.button("Scan for Opportunities (Market Price)")
+# app.py — Part 2/2
 
-# ---------------- Build Book Fetcher ----------------
-def build_book_fetcher(ex, exch_name: str, ob_cache_rest: dict):
-    exlower = exch_name.lower()
+def price_last(tickers: dict, symbol: str) -> Optional[float]:
+    t = tickers.get(symbol)
+    if not t:
+        return None
+    p = t.get("last")
+    try:
+        return float(p) if p is not None else None
+    except Exception:
+        return None
 
-    def fetch_from_ws_or_rest(from_c: str, to_c: str):
-        pair = get_pair(ex, from_c, to_c)
-        if not pair:
-            return None, None, None
+def conversion_rate_from_last(symbol: str, from_coin: str, to_coin: str, last_price: Optional[float]) -> Optional[float]:
+    """
+    For market symbol BASE/QUOTE with last price P (= QUOTE per 1 BASE):
+      - from BASE to QUOTE: rate = P
+      - from QUOTE to BASE: rate = 1/P
+    """
+    if last_price is None or last_price <= 0:
+        return None
+    base, quote = symbol.split("/")
+    # handle symbols like 'AAA/BBB:BBB'
+    if ":" in quote:
+        quote = quote.split(":")[0]
+    if from_coin == base and to_coin == quote:
+        return last_price
+    if from_coin == quote and to_coin == base:
+        return 1.0 / last_price
+    return None
 
-        if exlower in ("binance", "kucoin", "bybit"):
-            ws_manager.ensure_subscription(exlower, pair)
+def evaluate_triangle_market_last(ex, direction_coins, tickers, taker_fee: float, include_prices: bool):
+    """
+    direction_coins: [A, B, C] meaning A->B, B->C, C->A
+    Uses market 'last' price for all legs. Applies taker fee per leg.
+    Returns dict or None.
+    """
+    A, B, C = direction_coins
+    s1 = get_pair(ex, A, B)
+    s2 = get_pair(ex, B, C)
+    s3 = get_pair(ex, C, A)
+    if not s1 or not s2 or not s3:
+        return None
 
-            # ✅ Try WS cache immediately
-            book = ws_manager.get_book(exlower, pair)
-            if book and book.get("bids") and book.get("asks"):
-                return pair, book, "ws"
+    p1 = price_last(tickers, s1)
+    p2 = price_last(tickers, s2)
+    p3 = price_last(tickers, s3)
+    if p1 is None or p2 is None or p3 is None:
+        return None
 
-            # ✅ Fallback to REST if WS not ready
-            try:
-                if pair not in ob_cache_rest:
-                    ob_cache_rest[pair] = ex.fetch_order_book(pair, limit=ob_limit)
-                ob = ob_cache_rest[pair]
-                bids = [(float(p), float(q)) for p, q in ob.get("bids", [])][:ob_limit]
-                asks = [(float(p), float(q)) for p, q in ob.get("asks", [])][:ob_limit]
-                if bids and asks:
-                    return pair, {"bids": bids, "asks": asks, "ts": ob.get("timestamp", int(time.time()*1000))}, "rest-fallback"
-            except Exception:
-                return None, None, None
-            return None, None, None
+    r1 = conversion_rate_from_last(s1, A, B, p1)
+    r2 = conversion_rate_from_last(s2, B, C, p2)
+    r3 = conversion_rate_from_last(s3, C, A, p3)
+    if r1 is None or r2 is None or r3 is None:
+        return None
 
-        # ✅ REST only for other exchanges
-        try:
-            if pair not in ob_cache_rest:
-                ob_cache_rest[pair] = ex.fetch_order_book(pair, limit=ob_limit)
-            ob = ob_cache_rest[pair]
-            bids = [(float(p), float(q)) for p, q in ob.get("bids", [])][:ob_limit]
-            asks = [(float(p), float(q)) for p, q in ob.get("asks", [])][:ob_limit]
-            if bids and asks:
-                return pair, {"bids": bids, "asks": asks, "ts": ob.get("timestamp", int(time.time()*1000))}, "rest"
-        except Exception:
-            return None, None, None
-        return None, None, None
+    before = 1.0 * r1 * r2 * r3
+    after = before * (1 - taker_fee) ** 3
 
-    return fetch_from_ws_or_rest
+    row = {
+        "Coin Pairs": f"{A} -> {B} -> {C} -> {A}",
+        "Profit % BEFORE Fees": round((before - 1.0) * 100.0, 6),
+        "Profit % AFTER Fees": round((after - 1.0) * 100.0, 6),
+        "Fee % (total)": round(taker_fee * 3 * 100.0, 6),
+        "Reason": "OK"
+    }
+    if include_prices:
+        row.update({"Leg1 last": p1, "Leg2 last": p2, "Leg3 last": p3, "s1": s1, "s2": s2, "s3": s3})
+    return row
 
-# ---------------- Scan Button ----------------
-if st.button("Scan for Opportunities"):
-    with st.spinner("Scanning..."):
+def pick_taker_fee(ex, spot_markets: dict) -> float:
+    # try per-exchange unified fees first
+    fee = None
+    try:
+        fee = ex.fees.get("trading", {}).get("taker")
+    except Exception:
+        fee = None
+    if not fee:
+        # fall back to any market taker fee
+        first_symbol = next(iter(spot_markets)) if spot_markets else None
+        if first_symbol:
+            fee = spot_markets[first_symbol].get("taker")
+    return float(fee) if fee else 0.001  # 0.1% default
+
+if scan_btn:
+    with st.spinner("Scanning with market prices (last)…"):
         try:
             ex = getattr(ccxt, exchange_name)()
             ex.enableRateLimit = True
@@ -344,53 +355,62 @@ if st.button("Scan for Opportunities"):
 
             # spot-only
             spot_markets = {s: m for s, m in ex.markets.items() if m.get("spot", False)}
+
             triangles = find_triangles(spot_markets)
             total_raw = len(triangles)
-            triangles = triangles[:max_triangles]
-            st.write(f"🔍 Found {total_raw} unique spot triangles. Scanning {len(triangles)}...")
+            triangles = triangles[:int(max_triangles)]
+            st.write(f"🔍 Found {total_raw} unique spot triangles. Scanning {len(triangles)} (market price)…")
 
-            first_market = next((m for m in spot_markets) if spot_markets else None)
-            fee = ex.markets[first_market].get('taker', 0.001) if first_market else 0.001
+            # fetch all tickers once (efficient, avoids rate-limit)
+            tickers = ex.fetch_tickers()
 
-            ob_cache_rest: Dict[str, dict] = {}
-            book_fetcher = build_book_fetcher(ex, exchange_name, ob_cache_rest)
+            taker_fee = pick_taker_fee(ex, spot_markets)
 
             results = []
             for tri in triangles:
-                for direction in [list(tri), list(tri)[::-1]]:
-                    pb, pa, reason = calc_profit_best_bidask(direction, fee, book_fetcher)
-                    if pb is not None and pa is not None:
-                        results.append({
-                            "Coin Pairs": " -> ".join(direction) + f" -> {direction[0]}",
-                            "Profit % BEFORE Fees": pb,
-                            "Profit % AFTER Fees": pa,
-                            "Reason": reason,
-                            "Fee % (total)": round(fee * 3 * 100, 6)
-                        })
+                # two directions (A->B->C and A->C->B)
+                seq1 = [tri[0], tri[1], tri[2]]
+                seq2 = [tri[0], tri[2], tri[1]]
+
+                for seq in (seq1, seq2):
+                    row = evaluate_triangle_market_last(
+                        ex, seq, tickers, taker_fee, include_prices=show_leg_prices
+                    )
+                    if row:
+                        results.append(row)
 
             if results:
                 results.sort(key=lambda x: x["Profit % AFTER Fees"], reverse=True)
-                st.subheader(f"Top {min(len(results), 20)} Cycles")
+
+                st.subheader(f"Top {min(len(results), 20)} Cycles (Market Price)")
                 st.dataframe(pd.DataFrame(results[:20]), use_container_width=True)
 
                 profitable = [
                     r for r in results
-                    if r["Profit % AFTER Fees"] > min_profit and r["Reason"] == "OK"
+                    if (r["Reason"] == "OK") and (r["Profit % AFTER Fees"] > float(min_profit))
                 ]
                 if profitable:
                     st.subheader("Profitable Above Threshold")
                     st.dataframe(pd.DataFrame(profitable[:20]), use_container_width=True)
                 else:
                     st.info("No profitable cycles above threshold.")
+
+                # Download
+                st.download_button(
+                    "⬇️ Download CSV",
+                    pd.DataFrame(results).to_csv(index=False),
+                    file_name=f"triangular_market_{exchange_name}.csv",
+                    mime="text/csv",
+                )
             else:
-                st.info("No cycles produced results.")
+                st.info("No cycles produced results (missing prices or pairs).")
 
         except ccxt.RateLimitExceeded:
-            st.error("Rate limit exceeded. For Binance/KuCoin/Bybit, WebSockets are used to reduce this.")
+            st.error("Rate limit exceeded. (This version fetches tickers once per scan to minimize calls.)")
         except Exception as e:
             st.error(f"Error: {e}")
 
 st.caption(
-    "Now scanning all SPOT markets only. Shows both raw (before fees) and net (after fees) profit. "
-    "Binance/KuCoin/Bybit use WebSockets; others use REST."
-        )
+    "Now using market price (ticker['last']) for all legs. Fees applied as 3× taker. "
+    "WS order book manager kept for parity but not used in price calc."
+)
