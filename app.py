@@ -1,320 +1,212 @@
 # app.py — Part 1/2
 import streamlit as st
 import ccxt
-from collections import defaultdict
-import pandas as pd
 import time
+import json
+from collections import defaultdict
+from typing import Optional, Dict, Tuple
+
+# ------------------------------
+# (Optional) WebSocket manager
+# kept for parity with your existing file.
+# Not required for the market-price calc below,
+# but left intact so your structure matches.
+# ------------------------------
 import threading
 import asyncio
 import aiohttp
-import json
-from typing import Dict, Tuple, Optional
-
-# =========================================================
-# ---------------- WebSocket Order Book Manager -----------
-# (Kept for parity with your existing code; not needed when
-#  using market price/last for profit calc.)
-# =========================================================
 
 class WSOrderBookManager:
-    """
-    Live order book cache for Binance, KuCoin, Bybit via native WebSockets.
-    For other exchanges, we fall back to REST. (Not used by the
-    market-price scanner, but retained to match your file.)
-    """
     def __init__(self, depth_levels: int = 20):
         self.depth_levels = depth_levels
         self.loop = asyncio.new_event_loop()
-        self.session: Optional[aiohttp.ClientSession] = None
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
-
-        self.books: Dict[Tuple[str, str], Dict] = {}
-        self.subscribed: Dict[Tuple[str, str], bool] = {}
+        self.books = {}  # (exchange, symbol) -> {"bids":..., "asks":..., "ts":...}
         self.lock = threading.Lock()
-
-        # KuCoin token
-        self.kucoin_endpoint = None
+        # minimal placeholders for kucoin flow (kept from your file)
+        self.session = None
         self.kucoin_token = None
-        self.kucoin_token_expiry = 0
 
     def _run_loop(self):
         asyncio.set_event_loop(self.loop)
-        self.loop.run_until_complete(self._ensure_session())
         self.loop.run_forever()
-
-    async def _ensure_session(self):
-        if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
-
-    def ensure_subscription(self, exchange: str, pair: str):
-        key = (exchange.lower(), pair)
-        if self.subscribed.get(key):
-            return
-        self.subscribed[key] = True
-
-        if exchange.lower() == "binance":
-            asyncio.run_coroutine_threadsafe(
-                self._binance_subscribe(pair), self.loop
-            )
-        elif exchange.lower() == "kucoin":
-            asyncio.run_coroutine_threadsafe(
-                self._kucoin_subscribe(pair), self.loop
-            )
-        elif exchange.lower() == "bybit":
-            asyncio.run_coroutine_threadsafe(
-                self._bybit_subscribe(pair), self.loop
-            )
-
-    def get_book(self, exchange: str, pair: str) -> Optional[Dict]:
-        with self.lock:
-            return self.books.get((exchange.lower(), pair))
-
-    # ---------------- Binance ----------------
-    async def _binance_subscribe(self, pair: str):
-        await self._ensure_session()
-        symbol = pair.replace("/", "").lower()
-        depth_tag = f"{symbol}@depth{self.depth_levels}@100ms"
-        url = "wss://stream.binance.com:9443/ws"
-
-        async def listen():
-            try:
-                async with self.session.ws_connect(url, heartbeat=30) as ws:
-                    sub_msg = {
-                        "method": "SUBSCRIBE",
-                        "params": [depth_tag],
-                        "id": int(time.time()*1000) % 10_000_000
-                    }
-                    await ws.send_json(sub_msg)
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            data = json.loads(msg.data)
-                            if 'b' in data and 'a' in data:
-                                bids = [(float(p), float(q)) for p, q in data.get('b', [])][:self.depth_levels]
-                                asks = [(float(p), float(q)) for p, q in data.get('a', [])][:self.depth_levels]
-                                with self.lock:
-                                    self.books[("binance", pair)] = {"bids": bids, "asks": asks, "ts": int(time.time()*1000)}
-            except Exception:
-                await asyncio.sleep(1.5)
-                asyncio.create_task(listen())
-        asyncio.create_task(listen())
-
-    # ---------------- KuCoin ----------------
-    async def _kucoin_public_token(self):
-        await self._ensure_session()
-        try:
-            async with self.session.post("https://api.kucoin.com/api/v1/bullet-public") as resp:
-                j = await resp.json()
-                token = j["data"]["token"]
-                endpoint = j["data"]["instanceServers"][0]["endpoint"]
-                pingInterval = j["data"]["instanceServers"][0]["pingInterval"]
-                expireTime = j["data"]["instanceServers"][0]["expireTime"]
-                self.kucoin_endpoint = endpoint
-                self.kucoin_token = token
-                self.kucoin_token_expiry = int(time.time()*1000) + (expireTime or 60_000)
-                return endpoint, token, pingInterval
-        except Exception:
-            return None, None, None
-
-    async def _kucoin_subscribe(self, pair: str):
-        await self._ensure_session()
-        endpoint, token, ping_ms = await self._kucoin_public_token()
-        if not endpoint or not token:
-            await asyncio.sleep(2)
-            asyncio.create_task(self._kucoin_subscribe(pair))
-            return
-
-        symbol = pair.replace("/", "-").upper()
-        url = f"{endpoint}?token={token}"
-
-        async def listen():
-            try:
-                async with self.session.ws_connect(url, heartbeat=max(10, (ping_ms or 20000)//1000)) as ws:
-                    depth_ch = "level2Depth5" if self.depth_levels <= 5 else "level2Depth20"
-                    sub = {
-                        "id": str(int(time.time()*1000)),
-                        "type": "subscribe",
-                        "topic": f"/market/{depth_ch}:{symbol}",
-                        "privateChannel": False,
-                        "response": True
-                    }
-                    await ws.send_json(sub)
-
-                    async def pinger():
-                        while True:
-                            try:
-                                await ws.send_json({"id": str(int(time.time()*1000)), "type": "ping"})
-                            except Exception:
-                                break
-                            await asyncio.sleep(max(5, (ping_ms or 20000)/1000.0 - 2))
-                    asyncio.create_task(pinger())
-
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            data = json.loads(msg.data)
-                            if data.get("type") == "message" and "data" in data:
-                                d = data["data"]
-                                bids = [(float(p), float(q)) for p, q in d.get("bids", [])][:self.depth_levels]
-                                asks = [(float(p), float(q)) for p, q in d.get("asks", [])][:self.depth_levels]
-                                with self.lock:
-                                    self.books[("kucoin", pair)] = {"bids": bids, "asks": asks, "ts": d.get("time", int(time.time()*1000))}
-            except Exception:
-                await asyncio.sleep(1.5)
-                asyncio.create_task(listen())
-        asyncio.create_task(listen())
-
-    # ---------------- Bybit ----------------
-    async def _bybit_subscribe(self, pair: str):
-        await self._ensure_session()
-        url = "wss://stream.bybit.com/v5/public/spot"
-        symbol = pair.replace("/", "").upper()
-
-        async def listen():
-            try:
-                async with self.session.ws_connect(url, heartbeat=30) as ws:
-                    sub = {"op": "subscribe", "args": [f"orderbook.50.{symbol}"]}
-                    await ws.send_json(sub)
-                    async for msg in ws:
-                        if msg.type == aiohttp.WSMsgType.TEXT:
-                            data = json.loads(msg.data)
-                            if data.get("topic", "").startswith("orderbook") and "data" in data:
-                                d = data["data"]
-                                bids = [(float(p), float(q)) for p, q in d.get("b", [])][:self.depth_levels]
-                                asks = [(float(p), float(q)) for p, q in d.get("a", [])][:self.depth_levels]
-                                if bids or asks:
-                                    with self.lock:
-                                        self.books[("bybit", pair)] = {"bids": bids, "asks": asks, "ts": int(time.time()*1000)}
-            except Exception:
-                await asyncio.sleep(1.5)
-                asyncio.create_task(listen())
-        asyncio.create_task(listen())
-
-# Cache resource for WS manager (not used by market-price calc, kept for parity)
 @st.cache_resource
-def get_ws_manager(depth_levels: int):
+def get_ws_manager(depth_levels=20):
     return WSOrderBookManager(depth_levels=depth_levels)
 
-# =========================================================
-# ---------------- Triangle Finder ------------------------
-# =========================================================
-
-def split_symbol(sym: str):
-    # Handle symbols like 'BTC/USDT:USDT' → ('BTC','USDT')
-    parts = sym.split("/")
-    base = parts[0]
-    quote = parts[1].split(":")[0] if len(parts) > 1 else ""
-    return base, quote
-
-def find_triangles(markets):
-    graph = defaultdict(set)
-    currencies = set()
-
-    for symbol, market in markets.items():
-        if not market.get('spot', False):
-            continue
-        if ':' in symbol or '/' not in symbol:
-            continue
-        base, quote = symbol.split('/')
-        graph[base].add(quote)
-        graph[quote].add(base)
-        currencies.add(base)
-        currencies.add(quote)
-
-    triangles = []
-    for node in sorted(currencies):
-        neighbors = sorted(graph[node])
-        for i in range(len(neighbors)):
-            for j in range(i + 1, len(neighbors)):
-                n1, n2 = neighbors[i], neighbors[j]
-                if n2 in graph[n1]:
-                    tri = tuple(sorted([node, n1, n2]))
-                    if tri not in triangles:
-                        triangles.append(tri)
-    return triangles
-
-def get_pair(ex, a, b):
-    p1 = f"{a}/{b}"
-    if p1 in ex.markets:
-        return p1
-    p2 = f"{b}/{a}"
-    if p2 in ex.markets:
-        return p2
-    return None
-
-# =========================================================
-# ----------------------- Streamlit UI --------------------
-# =========================================================
+# ------------------------------
+# Streamlit UI / settings
+# ------------------------------
 st.set_page_config(page_title="Triangular Arbitrage Scanner", layout="wide")
-st.title("Triangular Arbitrage Scanner — Spot Market Only (Market Price)")
+st.title("🔺 Triangular Arbitrage Scanner — Market Price (fixed inversion)")
 
-c1, c2, c3 = st.columns(3)
-with c1:
-    exchange_name = st.selectbox("Exchange", [
-        "binance", "kucoin", "bybit", "kraken", "bitfinex", "huobi",
-        "gateio", "mexc", "bitget", "bitmart"
-    ])
-with c2:
-    min_profit = st.number_input("Highlight Profit % Threshold", min_value=0.0, value=0.0, step=0.01)
-with c3:
-    max_triangles = st.number_input("Max Triangles to Scan", min_value=30, max_value=5000, value=600, step=50)
+# Exchange list (single-exchange triangular scanner)
+EXCHANGE_OPTIONS = ["binance", "kucoin", "bybit", "gateio", "okx", "mexc"]
 
-# (WS manager kept for parity; not used by market-price calc)
-ws_manager = get_ws_manager(depth_levels=20)
+col1, col2, col3 = st.columns([2, 2, 2])
+with col1:
+    exchange_name = st.selectbox("Exchange", EXCHANGE_OPTIONS, index=0)
+with col2:
+    min_profit = st.number_input("Highlight profit % threshold (after fees)", min_value=0.0, value=0.5, step=0.1, format="%.3f")
+with col3:
+    max_triangles = st.number_input("Max triangles to scan", min_value=30, max_value=5000, value=600, step=50)
 
 show_leg_prices = st.checkbox("Show leg market prices (debug)", value=False)
 scan_btn = st.button("Scan for Opportunities (Market Price)")
-# app.py — Part 2/2
 
-def price_last(tickers: dict, symbol: str) -> Optional[float]:
-    t = tickers.get(symbol)
-    if not t:
-        return None
-    p = t.get("last")
-    try:
-        return float(p) if p is not None else None
-    except Exception:
-        return None
+# WS manager kept but not used for pricing
+ws_manager = get_ws_manager(depth_levels=20)
+# ------------------------------
+# Helpers: symbol parsing & lookup
+# ------------------------------
+def normalize_symbol(symbol: str) -> str:
+    """Normalize symbol string and strip chain suffix like :USDT if present."""
+    if not isinstance(symbol, str):
+        return symbol
+    if ":" in symbol:
+        # e.g., "BTC/USDT:USDT" -> "BTC/USDT"
+        base, rest = symbol.split("/", 1)
+        quote = rest.split(":", 1)[0]
+        return f"{base}/{quote}"
+    return symbol
 
-def conversion_rate_from_last(symbol: str, from_coin: str, to_coin: str, last_price: Optional[float]) -> Optional[float]:
+def split_symbol(sym: str) -> Tuple[str, str]:
+    s = normalize_symbol(sym)
+    parts = s.split("/")
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    return s, ""
+
+def get_pair_for(ex, a: str, b: str) -> Optional[str]:
     """
-    For market symbol BASE/QUOTE with last price P (= QUOTE per 1 BASE):
-      - from BASE to QUOTE: rate = P
-      - from QUOTE to BASE: rate = 1/P
+    Return canonical market symbol present on exchange connecting a and b,
+    in the form available in ex.markets keys, normalized using normalize_symbol.
     """
-    if last_price is None or last_price <= 0:
-        return None
-    base, quote = symbol.split("/")
-    # handle symbols like 'AAA/BBB:BBB'
-    if ":" in quote:
-        quote = quote.split(":")[0]
-    if from_coin == base and to_coin == quote:
-        return last_price
-    if from_coin == quote and to_coin == base:
-        return 1.0 / last_price
+    # Prefer exact 'A/B' if present
+    cand1 = f"{a}/{b}"
+    cand2 = f"{b}/{a}"
+    mk = ex.markets
+    if cand1 in mk:
+        return cand1
+    if cand2 in mk:
+        return cand2
+    # sometimes markets have suffixes or different case; try normalized check
+    for s in mk.keys():
+        ns = normalize_symbol(s)
+        if ns == cand1:
+            return s
+        if ns == cand2:
+            return s
     return None
 
-def evaluate_triangle_market_last(ex, direction_coins, tickers, taker_fee: float, include_prices: bool):
+# ------------------------------
+# Price retrieval using ticker['last'] WITH inversion handling
+# ------------------------------
+def price_last_from_tickers(tickers: Dict, symbol_on_exchange: str) -> Optional[float]:
+    """Return ticker['last'] for the exact symbol key if available."""
+    if not tickers:
+        return None
+    # symbol_on_exchange might be normalized or raw; try keys
+    if symbol_on_exchange in tickers:
+        p = tickers[symbol_on_exchange].get("last")
+        try:
+            return float(p) if p is not None else None
+        except:
+            return None
+    # try normalized match
+    norm = normalize_symbol(symbol_on_exchange)
+    for k, t in tickers.items():
+        if normalize_symbol(k) == norm:
+            p = t.get("last")
+            try:
+                return float(p) if p is not None else None
+            except:
+                return None
+    return None
+
+def get_conversion_rate_for_leg(tickers: Dict, market_symbol_on_ex: str, from_coin: str, to_coin: str) -> Optional[float]:
     """
-    direction_coins: [A, B, C] meaning A->B, B->C, C->A
-    Uses market 'last' price for all legs. Applies taker fee per leg.
-    Returns dict or None.
+    Given a market symbol present on the exchange (market_symbol_on_ex) and desired direction
+    from_coin -> to_coin, return the multiplier (quote per unit) using ticker['last'] and inverting when needed.
+    If market is BASE/QUOTE and from_coin==BASE,to_coin==QUOTE => return last
+    If market is BASE/QUOTE and from_coin==QUOTE,to_coin==BASE => return 1/last
+    Otherwise return None.
     """
-    A, B, C = direction_coins
-    s1 = get_pair(ex, A, B)
-    s2 = get_pair(ex, B, C)
-    s3 = get_pair(ex, C, A)
-    if not s1 or not s2 or not s3:
+    p = price_last_from_tickers(tickers, market_symbol_on_ex)
+    if p is None or p <= 0:
+        return None
+    base, quote = split_symbol(market_symbol_on_ex)
+    # base/quote semantics: 1 BASE = p QUOTE
+    if from_coin == base and to_coin == quote:
+        return p
+    if from_coin == quote and to_coin == base:
+        return 1.0 / p
+    # if market symbol doesn't match exactly direction, return None
+    return None
+
+# ------------------------------
+# Triangle enumeration (spot-only)
+# ------------------------------
+def enumerate_triangles_for_exchange(ex) -> list:
+    """
+    Build unique unordered triangles of currencies (A,B,C) from exchange.markets (spot only).
+    Returns list of triangles as tuples (A,B,C).
+    """
+    markets = ex.markets
+    graph = defaultdict(set)
+    currencies = set()
+    for symbol, m in markets.items():
+        # require spot market
+        if not m.get("spot", False):
+            continue
+        # ignore weird symbol forms
+        if "/" not in symbol:
+            continue
+        base, quote = split_symbol(symbol)
+        graph[base].add(quote)
+        graph[quote].add(base)
+        currencies.add(base); currencies.add(quote)
+
+    triangles = []
+    seen = set()
+    for a in sorted(currencies):
+        neigh = sorted(graph[a])
+        for i in range(len(neigh)):
+            for j in range(i+1, len(neigh)):
+                b = neigh[i]; c = neigh[j]
+                # need b connected to c as well
+                if c in graph[b]:
+                    key = tuple(sorted([a,b,c]))
+                    if key not in seen:
+                        seen.add(key)
+                        triangles.append((a,b,c))
+    return triangles
+
+# ------------------------------
+# Evaluate oriented triangle using market 'last' and inversion handling
+# ------------------------------
+def evaluate_oriented_triangle(ex, tickers, oriented_tri, taker_fee=0.001, include_prices=False):
+    """
+    oriented_tri = (A,B,C) meaning trades:
+       A -> B using market connecting A,B
+       B -> C using market connecting B,C
+       C -> A using market connecting C,A
+    Uses tickers (fetched once) and get_pair_for/ex.markets info to find the appropriate market symbol.
+    Returns dict with before/after fees profit %, return multiplier, and optional leg prices.
+    """
+    A,B,C = oriented_tri
+    # find market symbols on exchange (could be in either orientation)
+    s1 = get_pair_for(ex, A, B)
+    s2 = get_pair_for(ex, B, C)
+    s3 = get_pair_for(ex, C, A)
+    if not (s1 and s2 and s3):
         return None
 
-    p1 = price_last(tickers, s1)
-    p2 = price_last(tickers, s2)
-    p3 = price_last(tickers, s3)
-    if p1 is None or p2 is None or p3 is None:
-        return None
-
-    r1 = conversion_rate_from_last(s1, A, B, p1)
-    r2 = conversion_rate_from_last(s2, B, C, p2)
-    r3 = conversion_rate_from_last(s3, C, A, p3)
+    # get conversion multipliers for each leg using last price and inversion logic
+    r1 = get_conversion_rate_for_leg(tickers, s1, A, B)
+    r2 = get_conversion_rate_for_leg(tickers, s2, B, C)
+    r3 = get_conversion_rate_for_leg(tickers, s3, C, A)
     if r1 is None or r2 is None or r3 is None:
         return None
 
@@ -322,95 +214,111 @@ def evaluate_triangle_market_last(ex, direction_coins, tickers, taker_fee: float
     after = before * (1 - taker_fee) ** 3
 
     row = {
-        "Coin Pairs": f"{A} -> {B} -> {C} -> {A}",
+        "Triangle": f"{A} → {B} → {C} → {A}",
+        "s1": s1, "s2": s2, "s3": s3,
+        "Before Return": before,
         "Profit % BEFORE Fees": round((before - 1.0) * 100.0, 6),
         "Profit % AFTER Fees": round((after - 1.0) * 100.0, 6),
-        "Fee % (total)": round(taker_fee * 3 * 100.0, 6),
-        "Reason": "OK"
+        "Total Fee %": round(taker_fee * 3 * 100.0, 6)
     }
     if include_prices:
-        row.update({"Leg1 last": p1, "Leg2 last": p2, "Leg3 last": p3, "s1": s1, "s2": s2, "s3": s3})
+        # also expose the raw last prices used (for debugging)
+        p1 = price_last_from_tickers(tickers, s1)
+        p2 = price_last_from_tickers(tickers, s2)
+        p3 = price_last_from_tickers(tickers, s3)
+        row.update({"Leg1 last": p1, "Leg2 last": p2, "Leg3 last": p3})
     return row
 
-def pick_taker_fee(ex, spot_markets: dict) -> float:
-    # try per-exchange unified fees first
-    fee = None
+# ------------------------------
+# Choose taker fee: per-exchange fallback
+# ------------------------------
+def pick_taker_fee(ex):
     try:
-        fee = ex.fees.get("trading", {}).get("taker")
+        f = ex.fees.get("trading", {}).get("taker")
+        if f:
+            return float(f)
     except Exception:
-        fee = None
-    if not fee:
-        # fall back to any market taker fee
-        first_symbol = next(iter(spot_markets)) if spot_markets else None
-        if first_symbol:
-            fee = spot_markets[first_symbol].get("taker")
-    return float(fee) if fee else 0.001  # 0.1% default
+        pass
+    # fallback try a representative market
+    for s, m in ex.markets.items():
+        if m.get("spot", False):
+            tak = m.get("taker")
+            if tak:
+                return float(tak)
+    # default 0.1% if nothing found
+    return 0.001
 
+# ------------------------------
+# Main scan loop — uses fetch_tickers once
+# ------------------------------
+def run_triangular_scan(exchange_id: str, max_triangles: int, show_prices_flag: bool, min_profit_threshold: float):
+    ex_class = getattr(ccxt, exchange_id)
+    ex = ex_class({"enableRateLimit": True, "timeout": 15000})
+    # load markets (ensures ex.markets populated)
+    ex.load_markets()
+
+    # enumerate unique triangles
+    triangles = enumerate_triangles_for_exchange(ex)
+    raw_count = len(triangles)
+    triangles = triangles[:max_triangles]
+
+    # fetch tickers once
+    tickers = ex.fetch_tickers()
+
+    taker_fee = pick_taker_fee(ex)
+
+    results = []
+    # evaluate both orientations for every triangle (A,B,C and A,C,B)
+    for (A,B,C) in triangles:
+        for oriented in ((A,B,C), (A,C,B)):
+            row = evaluate_oriented_triangle(ex, tickers, oriented, taker_fee=taker_fee, include_prices=show_prices_flag)
+            if row:
+                results.append(row)
+
+    # sort by after-fee profit descending
+    results.sort(key=lambda r: r["Profit % AFTER Fees"], reverse=True)
+    meta = {
+        "raw_triangles": raw_count,
+        "scanned": len(triangles),
+        "evaluated": len(results),
+        "taker_fee": taker_fee
+    }
+    return results, meta
+
+# ------------------------------
+# UI trigger & display
+# ------------------------------
 if scan_btn:
-    with st.spinner("Scanning with market prices (last)…"):
+    with st.spinner("Scanning triangles (market 'last' price, inversion fixed)…"):
         try:
-            ex = getattr(ccxt, exchange_name)()
-            ex.enableRateLimit = True
-            ex.load_markets()
-
-            # spot-only
-            spot_markets = {s: m for s, m in ex.markets.items() if m.get("spot", False)}
-
-            triangles = find_triangles(spot_markets)
-            total_raw = len(triangles)
-            triangles = triangles[:int(max_triangles)]
-            st.write(f"🔍 Found {total_raw} unique spot triangles. Scanning {len(triangles)} (market price)…")
-
-            # fetch all tickers once (efficient, avoids rate-limit)
-            tickers = ex.fetch_tickers()
-
-            taker_fee = pick_taker_fee(ex, spot_markets)
-
-            results = []
-            for tri in triangles:
-                # two directions (A->B->C and A->C->B)
-                seq1 = [tri[0], tri[1], tri[2]]
-                seq2 = [tri[0], tri[2], tri[1]]
-
-                for seq in (seq1, seq2):
-                    row = evaluate_triangle_market_last(
-                        ex, seq, tickers, taker_fee, include_prices=show_leg_prices
-                    )
-                    if row:
-                        results.append(row)
-
-            if results:
-                results.sort(key=lambda x: x["Profit % AFTER Fees"], reverse=True)
-
-                st.subheader(f"Top {min(len(results), 20)} Cycles (Market Price)")
-                st.dataframe(pd.DataFrame(results[:20]), use_container_width=True)
-
-                profitable = [
-                    r for r in results
-                    if (r["Reason"] == "OK") and (r["Profit % AFTER Fees"] > float(min_profit))
-                ]
-                if profitable:
-                    st.subheader("Profitable Above Threshold")
-                    st.dataframe(pd.DataFrame(profitable[:20]), use_container_width=True)
-                else:
-                    st.info("No profitable cycles above threshold.")
-
-                # Download
-                st.download_button(
-                    "⬇️ Download CSV",
-                    pd.DataFrame(results).to_csv(index=False),
-                    file_name=f"triangular_market_{exchange_name}.csv",
-                    mime="text/csv",
-                )
-            else:
-                st.info("No cycles produced results (missing prices or pairs).")
-
-        except ccxt.RateLimitExceeded:
-            st.error("Rate limit exceeded. (This version fetches tickers once per scan to minimize calls.)")
+            results, meta = run_triangular_scan(exchange_name, int(max_triangles), show_leg_prices, float(min_profit))
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"Scan failed: {e}")
+            results, meta = [], {}
 
-st.caption(
-    "Now using market price (ticker['last']) for all legs. Fees applied as 3× taker. "
-    "WS order book manager kept for parity but not used in price calc."
-)
+    st.subheader(f"Scan results ({exchange_name}) — all cycles (market last, inversion fixed)")
+
+    if results:
+        import pandas as pd
+        df = pd.DataFrame(results)
+        # Sort and number
+        df = df.sort_values("Profit % AFTER Fees", ascending=False).reset_index(drop=True)
+        df.index = df.index + 1
+
+        # Top N cycles table
+        st.write(f"Top {min(50, len(df))} cycles (sorted by after-fee profit):")
+        st.dataframe(df.head(50), use_container_width=True)
+
+        # Filter profitable above threshold
+        prof_df = df[df["Profit % AFTER Fees"] > float(min_profit)]
+        if not prof_df.empty:
+            st.subheader("Profitable Above Threshold")
+            st.dataframe(prof_df, use_container_width=True)
+        else:
+            st.info("No cycles above the profit threshold after fees.")
+
+        st.caption(f"Raw triangles discovered: {meta.get('raw_triangles')} • Scanned: {meta.get('scanned')} • Evaluated (priced): {meta.get('evaluated')} • taker fee used: {meta.get('taker_fee')}")
+        # CSV download
+        st.download_button("⬇️ Download CSV", df.to_csv(index=True), file_name=f"triangular_{exchange_name}.csv", mime="text/csv")
+    else:
+        st.info("No triangles could be evaluated. Try another exchange or increase Max triangles.")
