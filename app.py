@@ -3,10 +3,6 @@ import ccxt
 from collections import defaultdict
 import pandas as pd
 import time
-import threading
-import asyncio
-import aiohttp
-import json
 from typing import Dict, Tuple, Optional
 
 # =========================================================
@@ -17,7 +13,7 @@ def find_triangles(markets):
     graph = defaultdict(set)
     currencies = set()
     for symbol, market in markets.items():
-        if not market.get('spot', False):
+        if not market.get('spot', False) or not market.get('active', True):
             continue
         if ':' in symbol or '/' not in symbol:
             continue
@@ -37,7 +33,7 @@ def find_triangles(markets):
                     tri = frozenset([node, n1, n2])
                     triangles.add(tri)
     
-    return [list(t) for t in triangles]  # Convert back to list of lists for downstream use
+    return [list(t) for t in triangles]
 
 def get_pair(ex, a, b):
     p1 = f"{a}/{b}"
@@ -58,7 +54,7 @@ st.title("Triangular Arbitrage Scanner — Spot Market Only (Market Price)")
 
 st.info("This scanner uses 'last' traded prices, which may show positive opportunities that disappear with bid/ask spreads. Use for screening only.")
 
-c1, c2, c3 = st.columns(3)
+c1, c2, c3, c4 = st.columns(4)
 with c1:
     exchange_name = st.selectbox("Exchange", [
         "binance", "kucoin", "bybit", "kraken", "bitfinex", "huobi",
@@ -68,6 +64,8 @@ with c2:
     min_profit = st.number_input("Highlight Profit % Threshold", min_value=0.0, value=0.0, step=0.01)
 with c3:
     max_triangles = st.number_input("Max Triangles to Scan", min_value=30, max_value=5000, value=600, step=50)
+with c4:
+    min_volume = st.number_input("Min 24h Volume (USDT equiv.)", min_value=0, value=10000, step=1000)
 
 show_leg_prices = st.checkbox("Show leg market prices (debug)", value=False)
 
@@ -97,7 +95,7 @@ def conversion_rate_from_last(symbol: str, from_coin: str, to_coin: str, last_pr
         return 1.0 / last_price
     return None
 
-def evaluate_triangle_market_last(ex, direction_coins, tickers, taker_fee: float, include_prices: bool):
+def evaluate_triangle_market_last(ex, direction_coins, tickers, taker_fee: float, include_prices: bool, min_vol: int):
     """
     direction_coins: [A, B, C] meaning A->B, B->C, C->A
     Uses market 'last' price for all legs. Applies taker fee per leg.
@@ -109,6 +107,21 @@ def evaluate_triangle_market_last(ex, direction_coins, tickers, taker_fee: float
     s3 = get_pair(ex, C, A)
     if not s1 or not s2 or not s3:
         return None
+
+    t1 = tickers.get(s1)
+    t2 = tickers.get(s2)
+    t3 = tickers.get(s3)
+    if not t1 or not t2 or not t3:
+        return None
+
+    # Skip stale prices (older than 1 hour)
+    current_ts = int(time.time() * 1000)
+    if any(t.get('timestamp', 0) < current_ts - 3600000 for t in [t1, t2, t3]):
+        return {"Coin Pairs": f"{A} -> {B} -> {C} -> {A}", "Reason": "Stale price(s)"}
+
+    # Skip low liquidity
+    if any(t.get('quoteVolume', 0) < min_vol for t in [t1, t2, t3]):
+        return {"Coin Pairs": f"{A} -> {B} -> {C} -> {A}", "Reason": "Low liquidity"}
 
     p1 = price_last(tickers, s1)
     p2 = price_last(tickers, s2)
@@ -173,8 +186,8 @@ if scan_btn:
             ex.enableRateLimit = True
             ex.load_markets()
 
-            # spot-only
-            spot_markets = {s: m for s, m in ex.markets.items() if m.get("spot", False)}
+            # spot-only and active
+            spot_markets = {s: m for s, m in ex.markets.items() if m.get("spot", False) and m.get('active', True)}
 
             triangles = find_triangles(spot_markets)
             total_raw = len(triangles)
@@ -197,7 +210,7 @@ if scan_btn:
                 seq2 = [tri[0], tri[2], tri[1]]
                 for seq in (seq1, seq2):
                     row = evaluate_triangle_market_last(
-                        ex, seq, tickers, taker_fee, include_prices=show_leg_prices
+                        ex, seq, tickers, taker_fee, include_prices=show_leg_prices, min_vol=min_volume
                     )
                     if row and row["Reason"] == "OK":
                         results.append(row)
@@ -235,4 +248,4 @@ if scan_btn:
 st.caption(
     "Using market price (ticker['last']) for all legs. Fees applied as 3× taker. "
     "Calculations are optimistic; verify with bid/ask spreads for real trades."
-    )
+                                                          )
