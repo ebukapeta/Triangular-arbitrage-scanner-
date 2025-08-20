@@ -1,15 +1,15 @@
-# app.py — Part 1/2
+# app.py — Triangular Arbitrage Scanner (Market Price + USD Normalized)
+
 import streamlit as st
 import ccxt
 import pandas as pd
-import time
 from collections import defaultdict
 from typing import Optional, Dict, Tuple
 
 st.set_page_config(page_title="Triangular Arbitrage Scanner", layout="wide")
-st.title("🔺 Triangular Arbitrage Scanner — Market Price (strict triangles)")
+st.title("🔺 Triangular Arbitrage Scanner — Market Price (USD Normalized)")
 
-# Exchanges we support
+# Supported exchanges
 EXCHANGE_OPTIONS = ["binance", "kucoin", "bybit", "gateio", "okx", "mexc"]
 
 # UI controls
@@ -58,10 +58,7 @@ def get_pair_for(ex, a: str, b: str) -> Optional[str]:
     return None
 
 def enumerate_triangles(ex) -> list:
-    """
-    Build valid triangles (A,B,C) where all three pairs exist.
-    Returns list of (A,B,C).
-    """
+    """Build valid triangles (A,B,C) where all three pairs exist."""
     markets = ex.markets
     graph = defaultdict(set)
     currencies = set()
@@ -87,13 +84,14 @@ def enumerate_triangles(ex) -> list:
                 if a in graph[c]:  # cycle complete
                     key = tuple(sorted([a, b, c]))
                     if key not in seen:
-                        # ✅ Check all 3 pairs exist
                         if get_pair_for(ex, a, b) and get_pair_for(ex, b, c) and get_pair_for(ex, c, a):
                             seen.add(key)
                             triangles.append((a, b, c))
     return triangles
-    # app.py — Part 2/2
 
+# ------------------------------
+# Pricing Helpers
+# ------------------------------
 def price_last_from_tickers(tickers: Dict, symbol: str) -> Optional[float]:
     if symbol in tickers and tickers[symbol].get("last"):
         return float(tickers[symbol]["last"])
@@ -126,6 +124,9 @@ def pick_taker_fee(ex):
             return float(m["taker"])
     return 0.001
 
+# ------------------------------
+# Evaluation
+# ------------------------------
 def evaluate_triangle(ex, tickers, tri, taker_fee):
     A, B, C = tri
     s1 = get_pair_for(ex, A, B)
@@ -141,6 +142,9 @@ def evaluate_triangle(ex, tickers, tri, taker_fee):
         return None
 
     before = r1 * r2 * r3
+    if before < 0.5 or before > 1.5:  # sanity filter
+        return None
+
     after = before * (1 - taker_fee) ** 3
     return {
         "Triangle": f"{A} → {B} → {C} → {A}",
@@ -150,6 +154,9 @@ def evaluate_triangle(ex, tickers, tri, taker_fee):
         "Profit % AFTER Fees": round((after - 1) * 100, 4)
     }
 
+# ------------------------------
+# Main Runner
+# ------------------------------
 def run_scan(exchange_id, max_tris, min_profit):
     ex_class = getattr(ccxt, exchange_id)
     ex = ex_class({"enableRateLimit": True, "timeout": 20000})
@@ -161,10 +168,9 @@ def run_scan(exchange_id, max_tris, min_profit):
 
     results = []
     for tri in triangles:
-        # try both orientations
         for oriented in [(tri[0], tri[1], tri[2]), (tri[0], tri[2], tri[1])]:
             row = evaluate_triangle(ex, tickers, oriented, taker_fee)
-            if row and row["Profit % AFTER Fees"] > -50:  # sanity filter
+            if row and row["Profit % AFTER Fees"] >= min_profit:
                 results.append(row)
 
     df = pd.DataFrame(results)
@@ -172,11 +178,10 @@ def run_scan(exchange_id, max_tris, min_profit):
         return None, taker_fee
     df = df.sort_values("Profit % AFTER Fees", ascending=False).reset_index(drop=True)
     df.index = df.index + 1
-    df = df[df["Profit % AFTER Fees"] >= min_profit]
     return df, taker_fee
 
 # ------------------------------
-# Run scan on button
+# Run Scan
 # ------------------------------
 if scan_btn:
     with st.spinner("Scanning triangles…"):
